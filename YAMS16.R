@@ -2,7 +2,6 @@
 
 # YAMS16 in R and refactored into functions
 # By John McCulloch and Jonathan Badger
-# Version 1.51 May 28, 2022
 
 # check if packages installed, installs them if needed, and loads them
 # by default normal R packages, bioconductor if bioconductor=TRUE
@@ -182,14 +181,21 @@ removeChimeras <- function(path, method = "consensus") {
 }
 
 # returns the most classified taxon of each taxtable row
+# NOTE: taxtable cells are already prefixed (e.g. "g__Lactobacillus",
+# "s__Unclassified"), so we detect unclassified cells by suffix.
 infer_LKT <- function(taxtable) {
     apply(taxtable, 1, function(x) {
-        undefined = which(x=="Unclassified")
-        if (length(undefined)==0) {
-            str_c("s__",str_replace(x[6],pattern="g__",""),
-                  "_",str_replace(x[7],pattern="s__",""))
+        undefined <- which(str_detect(x, "Unclassified$"))
+        if (length(undefined) == 0) {
+            # fully classified through species
+            str_c("s__", str_replace(x[6], pattern="g__", ""),
+                  "_", str_replace(x[7], pattern="s__", ""))
+        } else if (min(undefined) == 1) {
+            # nothing classified at all
+            "d__Unclassified"
         } else {
-            str_c(x[min(undefined)-1],"_",x[min(undefined)])
+            # classified down to some intermediate rank; append _Unclassified
+            str_c(x[min(undefined) - 1], "_Unclassified")
         }
     })
 }
@@ -217,6 +223,10 @@ taxonomy <- function(path, db="silva", yamsdir, species_boot=FALSE) {
         }
         taxa$Species <- taxa_Gs$Species
         colnames(taxa)[1] <- "Domain"
+        # Convert NAs to "Unclassified" BEFORE prefixing so that
+        # assignSpecies() NAs (and any other NAs) become "s__Unclassified"
+        # rather than "s__NA" or, worse, propagate NA through str_c().
+        taxa[is.na(taxa)] <- "Unclassified"
         cnames <- colnames(taxa)
         ranks <- c("d__","p__","c__","o__","f__","g__","s__")
         seqs <- row.names(taxa)
@@ -224,7 +234,6 @@ taxonomy <- function(path, db="silva", yamsdir, species_boot=FALSE) {
                                      function(i) taxa[,i] <-
                                                      str_c(ranks[i],taxa[,i])))
         colnames(taxa) <- cnames
-        taxa[is.na(taxa)] <- "Unclassified"
         taxa$LKT <- vapply(infer_LKT(taxa), paste, collapse = "|",
                            character(1L))
         lkt_names <- make.names(taxa$LKT,unique = TRUE)
@@ -246,31 +255,48 @@ taxonomy <- function(path, db="silva", yamsdir, species_boot=FALSE) {
 glomByLKT <- function(unittable, taxtable, repset=NULL, path=".") {
   unit <- read.csv(unittable, sep="\t", row.names = 1,
                     check.names = FALSE)
-                    
-  tax <- read.csv(taxtable, sep="\t", row.names = 1, 
+
+  tax <- read.csv(taxtable, sep="\t", row.names = 1,
                   check.names = FALSE)
-  
+
   unit$LKT <- tax[row.names(unit),]$LKT
   unit_LKT<-aggregate(. ~ LKT, unit, sum)
   row.names(unit_LKT) <- unit_LKT$LKT
   unit_LKT$LKT <- NULL
   unit_LKT <- unit_LKT[order(rowSums(unit_LKT), decreasing = TRUE),]
-  unit_LKT <- cbind(Taxon=row.names(unit_LKT), unit_LKT)
-  write.table(unit_LKT, file.path(path, "unit_table_LKT.tsv"), row.names=FALSE,
+  write.table(unit_LKT, file.path(path, "unit_table_LKT.tsv"),
                                         sep="\t", quote=FALSE)
-  
-  tax <- tax %>% distinct(LKT, .keep_all = TRUE) %>% data.frame(row.names = .$LKT)
-  tax <- tax[row.names(unit_LKT),]
-  tax <- cbind(Taxon=row.names(unit_LKT), tax)
-  write.table(tax, file.path(path, "taxa_16S_cons_LKT.tsv"),
-              row.names=FALSE, sep="\t", quote=FALSE)
+
+  # Pick one representative row per LKT BEFORE dropping the make.names-based
+  # row names, so we can still find each LKT's representative sequence in the
+  # rep_set fasta (whose headers are the make.names-uniquified row names).
+  tax_rep_key <- tax %>%
+    tibble::rownames_to_column("rep_id") %>%
+    distinct(LKT, .keep_all = TRUE)
+
+  tax_out <- tax_rep_key %>%
+    data.frame(row.names = .$LKT)
+  tax_out$rep_id <- NULL
+  tax_out <- tax_out[row.names(unit_LKT),]
+  write.table(tax_out, file.path(path, "taxa_16S_cons_LKT.tsv"),
+              sep="\t", quote=FALSE)
+
   if (!is.null(repset)) {
-    names <- row.names(tax) %>% gsub("/",".", .) %>%
-      gsub("-",".", .) %>% gsub(" ",".", ., fixed=TRUE) %>% gsub("[","", ., fixed=TRUE) %>% gsub("]", "",., fixed=TRUE) %>% gsub("^_Unclassified","X_Unclassified",.)
-    seqs <- read.fasta(repset)
-    names(seqs) <- names(seqs) %>% gsub("..",".",., fixed=TRUE) %>% gsub("__.","__",., fixed=TRUE)
-    seqs <- seqs[names]
-    write.fasta(lapply(seqs, str_to_upper), names=names(seqs),
+    # Map each LKT (in the order of unit_LKT) to its representative fasta id.
+    rep_ids <- tax_rep_key$rep_id[match(row.names(unit_LKT), tax_rep_key$LKT)]
+    all_seqs <- read.fasta(repset)
+    seqs <- all_seqs[rep_ids]
+    # Sanity check: warn if any lookups missed (would produce NULL entries).
+    missing <- is.na(rep_ids) | !rep_ids %in% names(all_seqs)
+    if (any(missing)) {
+      flog.warn(paste("Could not find fasta entry for",
+                      sum(missing), "LKT(s); dropping them from rep_set_LKT.fa"))
+      seqs <- seqs[!missing]
+      out_names <- row.names(unit_LKT)[!missing]
+    } else {
+      out_names <- row.names(unit_LKT)
+    }
+    write.fasta(seqs, names = out_names,
                 file.out = file.path(path, "rep_set_LKT.fa"))
   }
 }
@@ -279,7 +305,7 @@ glomByLKT <- function(unittable, taxtable, repset=NULL, path=".") {
 main <- function(args) {
     yamsdir <- getScriptPath()
     adapter <- file.path(yamsdir, "db/adapters/adapter.fasta")
-    version <- "1.05 08 Feb 2019"
+    version <- "1.06 (patched)"
     if (length(args)==0) {
         args <- c("-h")
     }
@@ -340,4 +366,3 @@ options(stringsAsFactors = FALSE)
 if (!interactive()) {
     main(commandArgs(trailingOnly = TRUE))
 }
-
