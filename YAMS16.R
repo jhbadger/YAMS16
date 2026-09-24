@@ -180,16 +180,27 @@ removeChimeras <- function(path, method = "consensus") {
     }
 }
 
+# Sanitize taxon strings: strip [ and ], collapse whitespace to _.
+# Applied to every cell of the taxonomy table before prefixing so that
+# all downstream artifacts (LKT strings, row names, fasta headers) are clean.
+sanitizeTaxon <- function(x) {
+    x <- gsub("\\[|\\]", "", x)
+    x <- gsub("\\s+", "_", x)
+    x
+}
+
 # returns the most classified taxon of each taxtable row
 # NOTE: taxtable cells are already prefixed (e.g. "g__Lactobacillus",
 # "s__Unclassified"), so we detect unclassified cells by suffix.
+# Column order is: Domain(d__), Kingdom(k__), Phylum(p__), Class(c__),
+# Order(o__), Family(f__), Genus(g__), Species(s__)  -> Genus=7, Species=8.
 infer_LKT <- function(taxtable) {
     apply(taxtable, 1, function(x) {
         undefined <- which(str_detect(x, "Unclassified$"))
         if (length(undefined) == 0) {
             # fully classified through species
-            str_c("s__", str_replace(x[6], pattern="g__", ""),
-                  "_", str_replace(x[7], pattern="s__", ""))
+            str_c("s__", str_replace(x[7], pattern="g__", ""),
+                  "_", str_replace(x[8], pattern="s__", ""))
         } else if (min(undefined) == 1) {
             # nothing classified at all
             "d__Unclassified"
@@ -223,12 +234,23 @@ taxonomy <- function(path, db="silva", yamsdir, species_boot=FALSE) {
         }
         taxa$Species <- taxa_Gs$Species
         colnames(taxa)[1] <- "Domain"
-        # Convert NAs to "Unclassified" BEFORE prefixing so that
-        # assignSpecies() NAs (and any other NAs) become "s__Unclassified"
-        # rather than "s__NA" or, worse, propagate NA through str_c().
+        # Add a Kingdom column populated from Domain, immediately after
+        # Domain, for downstream tools that expect a k__ rank.
+        taxa <- cbind(Domain = taxa$Domain,
+                      Kingdom = taxa$Domain,
+                      taxa[, setdiff(colnames(taxa), "Domain"), drop = FALSE],
+                      stringsAsFactors = FALSE)
+        # Coerce to character in case any column is a factor, then convert
+        # NAs to "Unclassified" BEFORE prefixing so that assignSpecies() NAs
+        # (and any other NAs) become "s__Unclassified" rather than leaking
+        # through str_c() as NA.
+        taxa[] <- lapply(taxa, as.character)
         taxa[is.na(taxa)] <- "Unclassified"
+        # Strip bracket characters and replace whitespace with underscores
+        # so LKT strings, row names, and fasta headers are safe downstream.
+        taxa[] <- lapply(taxa, sanitizeTaxon)
         cnames <- colnames(taxa)
-        ranks <- c("d__","p__","c__","o__","f__","g__","s__")
+        ranks <- c("d__","k__","p__","c__","o__","f__","g__","s__")
         seqs <- row.names(taxa)
         taxa <- as.data.frame(sapply(1:length(ranks),
                                      function(i) taxa[,i] <-
